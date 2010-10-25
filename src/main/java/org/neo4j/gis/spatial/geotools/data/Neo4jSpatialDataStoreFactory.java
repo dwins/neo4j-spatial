@@ -129,9 +129,13 @@ public class Neo4jSpatialDataStoreFactory implements DataStoreFactorySpi {
 		} else {
 			return null;
 		}
-		
-		File neostoreId = new File(url.getPath());
-        return neostoreId.getParentFile();		
+
+        if (url.getPath().endsWith("neostore.id")) {
+            File neostoreId = new File(url.getPath());
+            return neostoreId.getParentFile();
+        } else {
+            return null;
+        }
 	}
 	
 	
