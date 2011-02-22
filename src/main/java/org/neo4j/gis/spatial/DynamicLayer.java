@@ -20,6 +20,7 @@
 package org.neo4j.gis.spatial;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,7 +36,12 @@ import org.neo4j.graphdb.GraphDatabaseService;
 import org.neo4j.graphdb.Node;
 import org.neo4j.graphdb.Relationship;
 import org.neo4j.graphdb.Transaction;
+import org.neo4j.gis.spatial.geotools.data.Neo4jFeatureBuilder;
+import org.opengis.filter.Filter;
 import org.opengis.referencing.crs.CoordinateReferenceSystem;
+import org.opengis.feature.simple.SimpleFeature;
+import org.geotools.filter.text.cql2.CQLException;
+import org.geotools.filter.text.ecql.ECQL;
 
 import com.vividsolutions.jts.geom.Envelope;
 import com.vividsolutions.jts.geom.GeometryFactory;
@@ -113,128 +119,197 @@ public class DynamicLayer extends EditableLayerImpl {
 
 	}
 
-	public class DynamicIndexReader extends SpatialIndexReaderWrapper {
-		private JSONObject query;
+    public class CQLIndexReader extends SpatialIndexReaderWrapper {
+        private final Filter filter;
+        private final Neo4jFeatureBuilder builder;
 
-		private class DynamicRecordCounter extends RecordCounter {
-			public boolean needsToVisit(Node indexNode) {
-				return queryIndexNode(indexNode);
-			}
+        public CQLIndexReader(SpatialTreeIndex index, String query) throws CQLException, IOException {
+            super(index);
+            this.filter = ECQL.toFilter(query);
+            this.builder = new Neo4jFeatureBuilder(DynamicLayer.this);
+        }
 
-			public void onIndexReference(Node geomNode) {
-				if (queryLeafNode(geomNode)) {
-					super.onIndexReference(geomNode);
-				}
-			}
-		}
+        private class Counter extends RecordCounter {
+            public boolean needsToVisit(Node indexNode) {
+                return queryIndexNode(indexNode);
+            }
 
-		public DynamicIndexReader(SpatialTreeIndex index, String query) {
-			super(index);
-			this.query = (JSONObject)JSONValue.parse(query);
-		}
+            public void onIndexReference(Node geomNode) {
+                if (queryLeafNode(geomNode)) {
+                    super.onIndexReference(geomNode);
+                }
+            }
+        }
 
-		private boolean queryIndexNode(Node indexNode) {
-			// TODO: Support making the query on each index node for performance
-			return true;
-		}
+        private class FilteredSearch implements Search {
+            private Search delegate;
+            public FilteredSearch(Search delegate) {
+                this.delegate = delegate;
+            }
 
-		/**
-		 * Supports querying the geometry node for certain characteristics
-		 * defined by the original JSON query string. Initially this is only the
-		 * existence of certain properties and values, as well as the ability to
-		 * step through single relationships, testing nodes properties along the
-		 * way. For example:
-		 * 
-		 * <pre>
-		 * { "properties": {"type": "geometry"},
-		 *   "step": {"type": "GEOM", "direction": "INCOMING"
-		 *     "step": {"type": "TAGS", "direction": "OUTGOING"
-		 *       "properties": {"highway": "residential"}
-		 *     }
-		 *   }
-		 * }
-		 * </pre>
-		 * 
-		 * This will work with OSM datasets, traversing from the geometry node
-		 * to the way node and then to the tags node to test if the way is a
-		 * residential street.
-		 * 
-		 * @param geomNode
-		 * @return true if the node matches the query string, or the query
-		 *         string is empty
-		 */
-		private boolean queryLeafNode(Node geomNode) {
-			// TODO: Extend support for more complex queries
-			JSONObject properties = (JSONObject)query.get("properties");
-			JSONObject step = (JSONObject)query.get("step");
-			return queryNodeProperties(geomNode,properties) && stepAndQuery(geomNode,step);
-		}
-		
-		private boolean stepAndQuery(Node source, JSONObject step) {
-			if (step != null) {
-				JSONObject properties = (JSONObject) step.get("properties");
-				Relationship rel = source.getSingleRelationship(DynamicRelationshipType.withName(step.get("type").toString()), Direction
-				        .valueOf(step.get("direction").toString()));
-				if (rel != null) {
-					Node node = rel.getOtherNode(source);
-					step = (JSONObject) step.get("step");
-					return queryNodeProperties(node, properties) && stepAndQuery(node, step);
-				} else {
-					return false;
-				}
-			} else {
-				return true;
-			}
-		}
+            public List<SpatialDatabaseRecord> getResults() {
+                return delegate.getResults();
+            }
 
-		private boolean queryNodeProperties(Node node, JSONObject properties) {
-			if (properties != null) {
-				if(properties.containsKey("geometry")){
-					System.out.println("Unexpected 'geometry' in query string");
-					properties.remove("geometry");
-				}
-				for (Object key : properties.keySet()) {
-					Object value = node.getProperty(key.toString(), null);
-					Object match = properties.get(key);
-					//TODO: Find a better way to solve minor type mismatches (Long!=Integer) than the string conversion below
-					if (value == null || (match != null && !value.equals(match) && !value.toString().equals(match.toString()))) {
-						return false;
-					}
-				}
-			}
-			return true;
-		}
+            public void setLayer(Layer layer) {
+                delegate.setLayer(layer);
+            }
 
-		public int count() {
-			DynamicRecordCounter counter = new DynamicRecordCounter();
+            public boolean needsToVisit(Node indexNode) {
+                return delegate.needsToVisit(indexNode);
+            }
+
+            public void onIndexReference(Node geomNode) {
+                if (queryLeafNode(geomNode)) {
+                    delegate.onIndexReference(geomNode);
+                }
+            }
+        }
+
+        private boolean queryIndexNode(Node indexNode) {
+            return true;
+        }
+
+        private boolean queryLeafNode(Node indexNode) {
+            SpatialDatabaseRecord dbRecord = 
+                new SpatialDatabaseRecord(DynamicLayer.this, indexNode); 
+            SimpleFeature feature = builder.buildFeature(dbRecord);
+            return filter.evaluate(feature);
+        }
+
+   		public int count() {
+			Counter counter = new Counter();
 			index.visit(counter, index.getIndexRoot());
 			return counter.getResult();
 		}
 
 		public void executeSearch(final Search search) {
-			index.executeSearch(new Search() {
-
-				public List<SpatialDatabaseRecord> getResults() {
-					return search.getResults();
-				}
-
-				public void setLayer(Layer layer) {
-					search.setLayer(layer);
-				}
-
-				public boolean needsToVisit(Node indexNode) {
-					return search.needsToVisit(indexNode);
-				}
-
-				public void onIndexReference(Node geomNode) {
-					if (queryLeafNode(geomNode)) {
-						search.onIndexReference(geomNode);
-					}
-				}
-			});
+			index.executeSearch(new FilteredSearch(search));
 		}
+    }
 
-	}
+	// public class DynamicIndexReader extends SpatialIndexReaderWrapper {
+	// 	private JSONObject query;
+
+	// 	private class DynamicRecordCounter extends RecordCounter {
+	// 		public boolean needsToVisit(Node indexNode) {
+	// 			return queryIndexNode(indexNode);
+	// 		}
+
+	// 		public void onIndexReference(Node geomNode) {
+	// 			if (queryLeafNode(geomNode)) {
+	// 				super.onIndexReference(geomNode);
+	// 			}
+	// 		}
+	// 	}
+
+	// 	public DynamicIndexReader(SpatialTreeIndex index, String query) {
+	// 		super(index);
+	// 		this.query = (JSONObject)JSONValue.parse(query);
+	// 	}
+
+	// 	private boolean queryIndexNode(Node indexNode) {
+	// 		// TODO: Support making the query on each index node for performance
+	// 		return true;
+	// 	}
+
+	// 	/**
+	// 	 * Supports querying the geometry node for certain characteristics
+	// 	 * defined by the original JSON query string. Initially this is only the
+	// 	 * existence of certain properties and values, as well as the ability to
+	// 	 * step through single relationships, testing nodes properties along the
+	// 	 * way. For example:
+	// 	 * 
+	// 	 * <pre>
+	// 	 * { "properties": {"type": "geometry"},
+	// 	 *   "step": {"type": "GEOM", "direction": "INCOMING"
+	// 	 *     "step": {"type": "TAGS", "direction": "OUTGOING"
+	// 	 *       "properties": {"highway": "residential"}
+	// 	 *     }
+	// 	 *   }
+	// 	 * }
+	// 	 * </pre>
+	// 	 * 
+	// 	 * This will work with OSM datasets, traversing from the geometry node
+	// 	 * to the way node and then to the tags node to test if the way is a
+	// 	 * residential street.
+	// 	 * 
+	// 	 * @param geomNode
+	// 	 * @return true if the node matches the query string, or the query
+	// 	 *         string is empty
+	// 	 */
+	// 	private boolean queryLeafNode(Node geomNode) {
+	// 		// TODO: Extend support for more complex queries
+	// 		JSONObject properties = (JSONObject)query.get("properties");
+	// 		JSONObject step = (JSONObject)query.get("step");
+	// 		return queryNodeProperties(geomNode,properties) && stepAndQuery(geomNode,step);
+	// 	}
+	// 	
+	// 	private boolean stepAndQuery(Node source, JSONObject step) {
+	// 		if (step != null) {
+	// 			JSONObject properties = (JSONObject) step.get("properties");
+	// 			Relationship rel = source.getSingleRelationship(DynamicRelationshipType.withName(step.get("type").toString()), Direction
+	// 			        .valueOf(step.get("direction").toString()));
+	// 			if (rel != null) {
+	// 				Node node = rel.getOtherNode(source);
+	// 				step = (JSONObject) step.get("step");
+	// 				return queryNodeProperties(node, properties) && stepAndQuery(node, step);
+	// 			} else {
+	// 				return false;
+	// 			}
+	// 		} else {
+	// 			return true;
+	// 		}
+	// 	}
+
+	// 	private boolean queryNodeProperties(Node node, JSONObject properties) {
+	// 		if (properties != null) {
+	// 			if(properties.containsKey("geometry")){
+	// 				System.out.println("Unexpected 'geometry' in query string");
+	// 				properties.remove("geometry");
+	// 			}
+	// 			for (Object key : properties.keySet()) {
+	// 				Object value = node.getProperty(key.toString(), null);
+	// 				Object match = properties.get(key);
+	// 				//TODO: Find a better way to solve minor type mismatches (Long!=Integer) than the string conversion below
+	// 				if (value == null || (match != null && !value.equals(match) && !value.toString().equals(match.toString()))) {
+	// 					return false;
+	// 				}
+	// 			}
+	// 		}
+	// 		return true;
+	// 	}
+
+	// 	public int count() {
+	// 		DynamicRecordCounter counter = new DynamicRecordCounter();
+	// 		index.visit(counter, index.getIndexRoot());
+	// 		return counter.getResult();
+	// 	}
+
+	// 	public void executeSearch(final Search search) {
+	// 		index.executeSearch(new Search() {
+
+	// 			public List<SpatialDatabaseRecord> getResults() {
+	// 				return search.getResults();
+	// 			}
+
+	// 			public void setLayer(Layer layer) {
+	// 				search.setLayer(layer);
+	// 			}
+
+	// 			public boolean needsToVisit(Node indexNode) {
+	// 				return search.needsToVisit(indexNode);
+	// 			}
+
+	// 			public void onIndexReference(Node geomNode) {
+	// 				if (queryLeafNode(geomNode)) {
+	// 					search.onIndexReference(geomNode);
+	// 				}
+	// 			}
+	// 		});
+	// 	}
+
+	// }
 
 	/**
 	 * <p>
@@ -329,7 +404,13 @@ public class DynamicLayer extends EditableLayerImpl {
 
 		public SpatialIndexReader getIndex() {
 			if (index instanceof SpatialTreeIndex) {
-				return new DynamicIndexReader((SpatialTreeIndex) index, getQuery());
+                try {
+                    return new CQLIndexReader((SpatialTreeIndex) index, getQuery());
+                } catch (IOException e) {
+                    throw new SpatialDatabaseException("Error while creating DynamicLayer", e);
+                } catch (CQLException e) {
+                    throw new SpatialDatabaseException("Error while creating DynamicLayer", e);
+                }
 			} else {
 				throw new SpatialDatabaseException("Cannot make a DynamicLayer from a non-SpatialTreeIndex Layer");
 			}
@@ -409,6 +490,12 @@ public class DynamicLayer extends EditableLayerImpl {
 	}
 
 	protected LayerConfig addLayerConfig(String name, int type, String query) {
+        try {
+            ECQL.toFilter(query);
+        } catch (CQLException e) {
+            throw new SpatialDatabaseException("tried to create layer with invalid query (" + query + ")", e);
+        }
+
 		Layer layer = getLayerMap().get(name);
 		if (layer != null) {
 			if (layer instanceof LayerConfig) {

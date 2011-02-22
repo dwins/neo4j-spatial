@@ -209,9 +209,12 @@ public class OSMLayer extends DynamicLayer {
 	 * @param geometry type as defined in Constants.
 	 */
 	public LayerConfig addSimpleDynamicLayer(String key, String value, int gtype) {
-		HashMap<String, String> tags = new HashMap<String, String>();
-		tags.put(key, value);
-		return addDynamicLayerOnWayTags(value==null ? key : key + "-" + value, gtype, tags);
+        if (value == null) {
+            return addLayerConfig(key, gtype, key + " IS NOT NULL");
+        } else {
+            // TODO: Better escaping here
+            return addLayerConfig(key + "-" + value, gtype, key + " = '" + value + "'");
+        }
 	}
 
 	/**
@@ -220,7 +223,8 @@ public class OSMLayer extends DynamicLayer {
 	 * @param geometry type as defined in Constants.
 	 */
 	public LayerConfig addSimpleDynamicLayer(int gtype) {
-		return addDynamicLayerOnWayTags(SpatialDatabaseService.convertGeometryTypeToName(gtype), gtype, null);
+        return addLayerConfig(SpatialDatabaseService.convertGeometryTypeToName(gtype), gtype, "INCLUDE");
+		// return addDynamicLayerOnWayTags(SpatialDatabaseService.convertGeometryTypeToName(gtype), gtype, null);
 	}
 
 	/**
